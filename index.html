@@ -229,7 +229,8 @@
             time: 0,
             gesture: 'NONE',
             targetRotation: { x: 0, y: 0 },
-            focusIndex: -1
+            focusIndex: -1,
+            pauseUntil: 0 // Timestamp to resume gesture recognition
         };
 
         let camera, scene, renderer, composer;
@@ -299,8 +300,8 @@
 
                 } else if (mode === 'FOCUS') {
                     if (this.type === 'PHOTO' && idx === focusIdx) {
-                        // Focus Target
-                        targetPos.set(0, 2, 35); // In front of camera
+                        // Focus Target: In front of camera (0, 2, 50) -> move to (0, 2, 35)
+                        targetPos.set(0, 2, 35); 
                         targetScale.multiplyScalar(4.5);
                         // Face Camera
                         targetRot.set(0, 0, 0); 
@@ -315,7 +316,7 @@
                 this.mesh.scale.lerp(targetScale, 0.05);
                 
                 if (mode !== 'SCATTER') {
-                    // Manually lerp rotation using Quaternions for smoothness or Euler simple lerp
+                    // Manually lerp rotation
                     this.mesh.rotation.x = THREE.MathUtils.lerp(this.mesh.rotation.x, targetRot.x, 0.05);
                     this.mesh.rotation.y = THREE.MathUtils.lerp(this.mesh.rotation.y, targetRot.y, 0.05);
                     this.mesh.rotation.z = THREE.MathUtils.lerp(this.mesh.rotation.z, targetRot.z, 0.05);
@@ -349,8 +350,8 @@
             ctx.beginPath();
             ctx.moveTo(32, 0);
             ctx.lineTo(64, 0);
-            ctx.lineTo(64, 32); // Fix
-            ctx.lineTo(0, 64); // Fix
+            ctx.lineTo(64, 32);
+            ctx.lineTo(0, 64);
             ctx.lineTo(0, 32);
             ctx.fill();
 
@@ -503,23 +504,18 @@
                 const rand = Math.random();
 
                 if (rand > 0.95) {
-                    // Candy Cane
                     mesh = new THREE.Mesh(geoCane, matCane);
                     mesh.scale.setScalar(1.5);
                     type = 'CANDY';
                 } else if (rand > 0.6) {
-                    // Sphere (Red or Gold)
                     mesh = new THREE.Mesh(geoSphere, Math.random() > 0.5 ? matRed : matGold);
                     type = 'ORNAMENT';
                 } else {
-                    // Box (Green or Gold)
                     mesh = new THREE.Mesh(geoBox, Math.random() > 0.5 ? matGreen : matGold);
                     type = 'ORNAMENT';
                 }
 
-                // Random Initial Rotation
                 mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
-                
                 mainGroup.add(mesh);
                 particles.push(new Particle(mesh, type));
             }
@@ -561,7 +557,6 @@
             group.add(frame);
             group.add(photo);
             
-            // Random start pos
             group.position.set((Math.random()-0.5)*10, (Math.random()-0.5)*10, (Math.random()-0.5)*10);
             
             mainGroup.add(group);
@@ -607,7 +602,7 @@
                 video.srcObject = stream;
                 video.addEventListener('loadeddata', () => {
                     status.innerText = "Camera Ready. Make a Fist ✊ or Pinch 👌";
-                    document.getElementById('webcam-container').style.opacity = 1; // Actually hide logic handled by CSS, this is just internal flag
+                    document.getElementById('webcam-container').style.opacity = 1;
                 });
             } catch (err) {
                 console.error(err);
@@ -618,46 +613,60 @@
         function processGestures() {
             if (!handLandmarker || !video || video.paused) return;
 
+            // CHECK PAUSE TIMER
+            const now = Date.now();
+            if (now < STATE.pauseUntil) {
+                // While paused, reset target rotation to 0 smoothly so photo is centered
+                STATE.targetRotation.x *= 0.95;
+                STATE.targetRotation.y *= 0.95;
+                const remaining = Math.ceil((STATE.pauseUntil - now) / 1000);
+                document.getElementById('status-text').innerText = `Focusing... Resuming in ${remaining}s`;
+                return;
+            }
+
             if (video.currentTime !== lastVideoTime) {
                 lastVideoTime = video.currentTime;
                 const results = handLandmarker.detectForVideo(video, performance.now());
 
                 if (results.landmarks && results.landmarks.length > 0) {
-                    const lm = results.landmarks[0]; // First hand
+                    const lm = results.landmarks[0];
 
-                    // Keypoints: Wrist(0), Thumb(4), Index(8), Middle(12), Ring(16), Pinky(20)
                     const wrist = lm[0];
                     const thumb = lm[4];
                     const index = lm[8];
-                    const tips = [lm[12], lm[16], lm[20]];
+                    
+                    // All four non-thumb tips
+                    const tips = [lm[8], lm[12], lm[16], lm[20]];
+                    // Tips excluding index for FOCUS trigger logic
+                    const otherTips = [lm[12], lm[16], lm[20]];
 
-                    // 1. Interactive Rotation (Map palm center ~9)
                     const palm = lm[9];
-                    // Map x from [0,1] to [-PI, PI]
                     STATE.targetRotation.y = (palm.x - 0.5) * Math.PI; 
                     STATE.targetRotation.x = (palm.y - 0.5) * Math.PI * 0.5;
 
-                    // 2. Gesture Recognition
-                    
-                    // Pinch: Thumb to Index
                     const pinchDist = Math.hypot(thumb.x - index.x, thumb.y - index.y);
                     
-                    // Fist vs Open: Avg dist of finger tips to wrist
                     let avgDist = 0;
                     tips.forEach(t => {
                         avgDist += Math.hypot(t.x - wrist.x, t.y - wrist.y);
                     });
-                    avgDist /= 3;
+                    avgDist /= 5; // Averaging four fingers
 
-                    if (pinchDist < 0.05) {
-                        setMode('FOCUS');
-                    } else if (avgDist < 0.25) {
+                    let otherAvgDist = 0;
+                    otherTips.forEach(t => {
+                        otherAvgDist += Math.hypot(t.x - wrist.x, t.y - wrist.y);
+                    });
+                    otherAvgDist /= 3; // Averaging middle, ring, pinky
+
+                    // FOCUS CONDITION: Pinch (dist < 0.05) AND other fingers extended (> 0.25) AND currently in SCATTER mode
+                    if (avgDist < 0.25){
                         setMode('TREE');
-                    } else if (avgDist > 0.4) {
+                    } else if (pinchDist < 0.04 && otherAvgDist > 0.05 && STATE.mode === 'SCATTER')  {
+                        setMode('FOCUS');
+                    } else if (avgDist > 0.27) {
                         setMode('SCATTER');
                     }
                 } else {
-                    // No hand -> slowly reset rotation
                     STATE.targetRotation.x *= 0.95;
                     STATE.targetRotation.y *= 0.95;
                 }
@@ -666,15 +675,19 @@
 
         function setMode(newMode) {
             if (STATE.mode === newMode) return;
+            
             STATE.mode = newMode;
-            document.getElementById('status-text').innerText = `Mode: ${newMode}`;
             
             if (newMode === 'FOCUS') {
-                // Pick random photo index
+                // REDUCED PAUSE TO  SECONDS
+                STATE.pauseUntil = Date.now() + 1800;
+                
                 const photos = particles.map((p, i) => p.type === 'PHOTO' ? i : -1).filter(i => i !== -1);
                 if (photos.length > 0) {
                     STATE.focusIndex = photos[Math.floor(Math.random() * photos.length)];
                 }
+            } else {
+                document.getElementById('status-text').innerText = `Mode: ${newMode}`;
             }
         }
 
@@ -695,32 +708,23 @@
         function animate() {
             requestAnimationFrame(animate);
 
-            // Time
             STATE.time += 0.01;
 
-            // Vision Inference
             processGestures();
 
-            // Rotate Main Group based on Hand
             mainGroup.rotation.y = THREE.MathUtils.lerp(mainGroup.rotation.y, STATE.targetRotation.y, 0.1);
             mainGroup.rotation.x = THREE.MathUtils.lerp(mainGroup.rotation.x, STATE.targetRotation.x, 0.1);
             
-            // Auto rotate slightly if no interaction
-            if (Math.abs(STATE.targetRotation.y) < 0.1 && STATE.mode === 'TREE') {
+            if (Date.now() >= STATE.pauseUntil && Math.abs(STATE.targetRotation.y) < 0.1 && STATE.mode === 'TREE') {
                 mainGroup.rotation.y += 0.002;
             }
 
-            // Update Particles
             particles.forEach((p, i) => p.update(STATE.mode, STATE.focusIndex, i));
 
-            // Dust Animation
             dustGroup.rotation.y -= 0.001;
-            dustGroup.children[0].geometry.attributes.position.needsUpdate = true; // Optimization: usually static geometry, but if we wanted wave effect
-
             composer.render();
         }
 
-        // Boot
         init();
 
     </script>
